@@ -1,0 +1,4 @@
+--> 当前训练使用的计算设备: mps
+train rows=331776 val rows=82944
+materializing training windows into memory tensors...
+train windows=297312 val windows=48480

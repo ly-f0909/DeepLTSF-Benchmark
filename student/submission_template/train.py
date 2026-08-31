@@ -11,21 +11,11 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 
+from src.dataset import TiDEDataset, chronological_split
+from src.features import COVARIATE_COLS, FEATURE_COLS, NUM_COVARIATES, NUM_FEATURES, TARGET_COL
 from src.model import ForecastModel
-
-TARGET_COL = "target"
-COVARIATE_COLS = [
-    "hour_sin", "hour_cos", "dow_sin", "dow_cos", "is_weekend", "trend",
-    "workload_intensity", "demand_forecast", "staffing_forecast",
-    "upstream_quality_forecast", "promotion_intensity", "shock_risk",
-    "maintenance_known", "unit_reliability_forecast", "queue_pressure_forecast",
-    "network_pressure_forecast", "event_load_forecast",
-    "service_irregularity_risk_forecast", "throughput_disruption_risk_forecast",
-    "nominal_capacity", "zone_sin", "zone_cos",
-]
-FEATURE_COLS = COVARIATE_COLS + [TARGET_COL]
 
 
 def set_seed(seed: int = 42) -> None:
@@ -34,78 +24,13 @@ def set_seed(seed: int = 42) -> None:
     torch.manual_seed(seed)
 
 
-class SlidingWindowDataset(Dataset):
-    """Pre-materialized float32 tensor windows; __getitem__ is pure tensor indexing."""
-
-    def __init__(
-        self,
-        frame: pd.DataFrame,
-        seq_len: int,
-        pred_len: int,
-        covariate_cols: list[str],
-        target_col: str,
-    ) -> None:
-        past_targets: list[torch.Tensor] = []
-        past_covs: list[torch.Tensor] = []
-        future_covs: list[torch.Tensor] = []
-        future_targets: list[torch.Tensor] = []
-
-        for _, group in frame.groupby("series_id", sort=False):
-            sorted_group = group.sort_values("timestamp")
-            cov = torch.from_numpy(
-                sorted_group[covariate_cols].astype(np.float32).fillna(0.0).to_numpy()
-            )
-            target = torch.from_numpy(
-                sorted_group[[target_col]].astype(np.float32).fillna(0.0).to_numpy()
-            ).squeeze(-1)
-
-            n = target.shape[0]
-            for start in range(0, n - seq_len - pred_len + 1):
-                end = start + seq_len
-                fut_end = end + pred_len
-                past_targets.append(target[start:end])
-                past_covs.append(cov[start:end])
-                future_covs.append(cov[end:fut_end])
-                future_targets.append(target[end:fut_end])
-
-        if not past_targets:
-            raise ValueError("No training windows could be created; check seq_len/pred_len and data size.")
-
-        self.past_target = torch.stack(past_targets)
-        self.past_cov = torch.stack(past_covs)
-        self.future_cov = torch.stack(future_covs)
-        self.future_target = torch.stack(future_targets)
-
-    def __len__(self) -> int:
-        return self.past_target.shape[0]
-
-    def __getitem__(
-        self, idx: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        return (
-            self.past_target[idx],
-            self.past_cov[idx],
-            self.future_cov[idx],
-            self.future_target[idx],
-        )
-
-
-def chronological_split(df: pd.DataFrame, train_ratio: float = 0.8) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Split by global timestamp order (no shuffle)."""
-    df = df.copy()
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
-    times = np.sort(df["timestamp"].unique())
-    cut = times[int(len(times) * train_ratio) - 1]
-    train_df = df[df["timestamp"] <= cut]
-    val_df = df[df["timestamp"] > cut]
-    return train_df, val_df
-
-
 def build_loss_fn(loss_name: str) -> nn.Module:
     if loss_name == "l1":
         return nn.L1Loss()
     if loss_name == "smooth_l1":
         return nn.SmoothL1Loss()
+    if loss_name == "huber":
+        return nn.HuberLoss()
     raise ValueError(f"Unsupported loss: {loss_name!r}")
 
 
@@ -118,15 +43,14 @@ def evaluate(
 ) -> float:
     model.eval()
     total, n = 0.0, 0
-    for past_target, past_cov, future_cov, future_target in loader:
-        past_target = past_target.to(device)
-        past_cov = past_cov.to(device)
-        future_cov = future_cov.to(device)
-        future_target = future_target.to(device)
-        pred = model(past_target, past_cov, future_cov)
-        loss = loss_fn(pred, future_target)
-        total += loss.item() * past_target.size(0)
-        n += past_target.size(0)
+    for x_past, x_future, y_target in loader:
+        x_past = x_past.to(device)
+        x_future = x_future.to(device)
+        y_target = y_target.to(device)
+        pred = model(x_past, x_future)
+        loss = loss_fn(pred, y_target)
+        total += loss.item() * x_past.size(0)
+        n += x_past.size(0)
     return total / max(n, 1)
 
 
@@ -135,18 +59,21 @@ def build_config(args: argparse.Namespace) -> dict:
         "model_type": "tide",
         "seq_len": args.seq_len,
         "pred_len": args.pred_len,
-        "num_covariates": len(COVARIATE_COLS),
+        "num_features": NUM_FEATURES,
+        "num_covariates": NUM_COVARIATES,
+        "target_idx": FEATURE_COLS.index(TARGET_COL),
         "hidden_dim": args.hidden_dim,
         "num_encoder_layers": args.num_encoder_layers,
         "num_decoder_layers": args.num_decoder_layers,
         "dropout": args.dropout,
         "use_revin": args.use_revin,
         "covariate_cols": COVARIATE_COLS,
-        "target_col": TARGET_COL,
         "feature_cols": FEATURE_COLS,
+        "target_col": TARGET_COL,
         "loss": args.loss,
         "weight_decay": args.weight_decay,
         "lr": args.lr,
+        "min_lr": args.min_lr,
     }
 
 
@@ -159,12 +86,14 @@ def main() -> None:
     parser.add_argument("--hidden_dim", type=int, default=256)
     parser.add_argument("--num_encoder_layers", type=int, default=2)
     parser.add_argument("--num_decoder_layers", type=int, default=2)
-    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument("--batch_size", type=int, default=512)
-    parser.add_argument("--epochs", type=int, default=15)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--min_lr", type=float, default=1e-5)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--loss", choices=["smooth_l1", "l1"], default="smooth_l1")
+    parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument("--loss", choices=["smooth_l1", "l1", "huber"], default="smooth_l1")
     parser.add_argument("--use_revin", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--num_workers", type=int, default=0)
     args = parser.parse_args()
@@ -181,13 +110,9 @@ def main() -> None:
     train_df, val_df = chronological_split(raw, 0.8)
     print(f"train rows={len(train_df)} val rows={len(val_df)}")
 
-    print("materializing training windows into memory tensors...")
-    train_ds = SlidingWindowDataset(
-        train_df, args.seq_len, args.pred_len, COVARIATE_COLS, TARGET_COL
-    )
-    val_ds = SlidingWindowDataset(
-        val_df, args.seq_len, args.pred_len, COVARIATE_COLS, TARGET_COL
-    )
+    print("materializing training windows into memory tensors...", flush=True)
+    train_ds = TiDEDataset(train_df, args.seq_len, args.pred_len)
+    val_ds = TiDEDataset(val_df, args.seq_len, args.pred_len)
     print(f"train windows={len(train_ds)} val windows={len(val_ds)}")
 
     train_loader = DataLoader(
@@ -209,7 +134,9 @@ def main() -> None:
     model = ForecastModel(
         seq_len=config["seq_len"],
         pred_len=config["pred_len"],
+        num_features=config["num_features"],
         num_covariates=config["num_covariates"],
+        target_idx=config["target_idx"],
         hidden_dim=config["hidden_dim"],
         num_encoder_layers=config["num_encoder_layers"],
         num_decoder_layers=config["num_decoder_layers"],
@@ -219,25 +146,25 @@ def main() -> None:
 
     loss_fn = build_loss_fn(args.loss)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.min_lr)
 
     best_val = float("inf")
     for epoch in range(1, args.epochs + 1):
         model.train()
         running, n = 0.0, 0
-        for past_target, past_cov, future_cov, future_target in train_loader:
-            past_target = past_target.to(device)
-            past_cov = past_cov.to(device)
-            future_cov = future_cov.to(device)
-            future_target = future_target.to(device)
+        for x_past, x_future, y_target in train_loader:
+            x_past = x_past.to(device)
+            x_future = x_future.to(device)
+            y_target = y_target.to(device)
 
             optimizer.zero_grad()
-            pred = model(past_target, past_cov, future_cov)
-            loss = loss_fn(pred, future_target)
+            pred = model(x_past, x_future)
+            loss = loss_fn(pred, y_target)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.max_grad_norm)
             optimizer.step()
-            running += loss.item() * past_target.size(0)
-            n += past_target.size(0)
+            running += loss.item() * x_past.size(0)
+            n += x_past.size(0)
 
         scheduler.step()
         train_loss = running / max(n, 1)

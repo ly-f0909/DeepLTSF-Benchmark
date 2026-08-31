@@ -9,18 +9,8 @@ import numpy as np
 import pandas as pd
 import torch
 
+from src.features import COVARIATE_COLS, FEATURE_COLS, TARGET_COL, TARGET_IDX
 from src.model import ForecastModel
-
-COVARIATE_COLS = [
-    "hour_sin", "hour_cos", "dow_sin", "dow_cos", "is_weekend", "trend",
-    "workload_intensity", "demand_forecast", "staffing_forecast",
-    "upstream_quality_forecast", "promotion_intensity", "shock_risk",
-    "maintenance_known", "unit_reliability_forecast", "queue_pressure_forecast",
-    "network_pressure_forecast", "event_load_forecast",
-    "service_irregularity_risk_forecast", "throughput_disruption_risk_forecast",
-    "nominal_capacity", "zone_sin", "zone_cos",
-]
-TARGET_COL = "target"
 
 
 def load_forecast_index(input_dir: Path) -> pd.DataFrame:
@@ -58,11 +48,13 @@ def build_model_from_checkpoint(checkpoint: dict) -> ForecastModel:
     return ForecastModel(
         seq_len=config.get("seq_len", 336),
         pred_len=config.get("pred_len", 24),
+        num_features=config.get("num_features", len(FEATURE_COLS)),
         num_covariates=config.get("num_covariates", len(COVARIATE_COLS)),
+        target_idx=config.get("target_idx", TARGET_IDX),
         hidden_dim=config.get("hidden_dim", 256),
         num_encoder_layers=config.get("num_encoder_layers", 2),
         num_decoder_layers=config.get("num_decoder_layers", 2),
-        dropout=config.get("dropout", 0.1),
+        dropout=config.get("dropout", 0.2),
         use_revin=config.get("use_revin", True),
     )
 
@@ -85,6 +77,13 @@ def extract_future_covariates(
     return values
 
 
+def build_past_window(values: np.ndarray, seq_len: int) -> np.ndarray:
+    if len(values) < seq_len:
+        pad = np.repeat(values[:1], seq_len - len(values), axis=0)
+        return np.concatenate([pad, values], axis=0)
+    return values[-seq_len:]
+
+
 @torch.no_grad()
 def forecast_series(
     model: ForecastModel,
@@ -102,15 +101,8 @@ def forecast_series(
         .sort_values("timestamp")
     )
 
-    past_target = (
-        hist.reindex(columns=[TARGET_COL])
-        .astype(np.float32)
-        .fillna(0.0)
-        .to_numpy()
-        .reshape(-1)
-    )
-    past_cov = (
-        hist.reindex(columns=COVARIATE_COLS)
+    values = (
+        hist.reindex(columns=FEATURE_COLS)
         .astype(np.float32)
         .fillna(0.0)
         .to_numpy()
@@ -121,29 +113,22 @@ def forecast_series(
     steps_done = 0
 
     while steps_done < horizon:
-        if len(past_target) < seq_len:
-            pad_len = seq_len - len(past_target)
-            past_target = np.concatenate([np.repeat(past_target[:1], pad_len), past_target])
-            past_cov = np.concatenate([np.repeat(past_cov[:1], pad_len, axis=0), past_cov], axis=0)
-        else:
-            past_target = past_target[-seq_len:]
-            past_cov = past_cov[-seq_len:]
-
         take = min(pred_len, horizon - steps_done)
-        future_cov = extract_future_covariates(future_cov_frame, steps_done, take)
-        if take < pred_len:
-            pad = np.zeros((pred_len - take, len(COVARIATE_COLS)), dtype=np.float32)
-            future_cov = np.concatenate([future_cov, pad], axis=0)
+        x_past = build_past_window(values, seq_len)
+        x_future = extract_future_covariates(future_cov_frame, steps_done, pred_len)
 
         pred_block = model(
-            torch.from_numpy(past_target).unsqueeze(0).to(device),
-            torch.from_numpy(past_cov).unsqueeze(0).to(device),
-            torch.from_numpy(future_cov).unsqueeze(0).to(device),
+            torch.from_numpy(x_past).unsqueeze(0).to(device),
+            torch.from_numpy(x_future).unsqueeze(0).to(device),
         )[0].detach().cpu().numpy()[:take]
 
         preds.extend(pred_block.tolist())
-        past_target = np.concatenate([past_target, pred_block])
-        past_cov = np.concatenate([past_cov, future_cov[:take]], axis=0)
+
+        future_cov_known = x_future[:take]
+        appended = np.zeros((take, len(FEATURE_COLS)), dtype=np.float32)
+        appended[:, : len(COVARIATE_COLS)] = future_cov_known
+        appended[:, TARGET_IDX] = pred_block
+        values = np.concatenate([values, appended], axis=0)
         steps_done += take
 
     return np.asarray(preds[:horizon], dtype=np.float64)
