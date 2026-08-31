@@ -2,3 +2,11 @@
 train rows=331776 val rows=82944
 materializing training windows into memory tensors...
 train windows=297312 val windows=48480
+epoch 01  lr=9.97e-04  train_smooth_l1=1.933159  val_smooth_l1=1.496713
+  saved best -> checkpoint.pt (val_smooth_l1=1.496713)
+epoch 02  lr=9.89e-04  train_smooth_l1=1.511605  val_smooth_l1=1.466139
+  saved best -> checkpoint.pt (val_smooth_l1=1.466139)
+epoch 03  lr=9.76e-04  train_smooth_l1=1.439646  val_smooth_l1=1.441660
+  saved best -> checkpoint.pt (val_smooth_l1=1.441660)
+epoch 04  lr=9.57e-04  train_smooth_l1=1.380214  val_smooth_l1=1.337744
+  saved best -> checkpoint.pt (val_smooth_l1=1.337744)

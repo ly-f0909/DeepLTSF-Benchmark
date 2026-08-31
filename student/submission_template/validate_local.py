@@ -9,7 +9,14 @@ import numpy as np
 import pandas as pd
 import torch
 
-from predict import build_model_from_checkpoint, forecast_series, load_forecast_index, load_history_frame
+from predict import build_model_from_checkpoint, forecast_series, resolve_device
+from src.data_io import (
+    get_series_future_cov,
+    get_series_history,
+    load_cov_frame,
+    load_forecast_index,
+    load_train_frame,
+)
 from src.features import TARGET_COL
 from src.metrics import compute_metrics, format_metrics
 
@@ -20,7 +27,6 @@ def run_oa_inference(
     output_file: Path,
     device: torch.device,
 ) -> pd.DataFrame:
-    """Run the same inference path used for leaderboard submission."""
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
         state = checkpoint["state_dict"]
@@ -36,18 +42,18 @@ def run_oa_inference(
     model.to(device)
 
     forecast_index = load_forecast_index(data_dir)
-    forecast_index["timestamp"] = pd.to_datetime(forecast_index["timestamp"])
-    history_frame = load_history_frame(data_dir)
+    train_frame = load_train_frame(data_dir)
+    cov_frame = load_cov_frame(data_dir)
 
     rows = []
     for series_id, index_part in forecast_index.groupby("series_id", sort=False):
-        hist = history_frame.loc[history_frame["series_id"].eq(series_id)]
         t0 = index_part["timestamp"].min()
-        hist = hist.loc[hist["timestamp"] < t0]
+        hist = get_series_history(train_frame, series_id, t0)
         if hist.empty:
-            raise ValueError(f"No history for series {series_id!r} before {t0}.")
+            raise ValueError(f"No history in train.csv for series {series_id!r} before {t0}.")
 
-        yhat = forecast_series(model, hist, index_part, history_frame, device)
+        future_cov = get_series_future_cov(cov_frame, train_frame, series_id, index_part)
+        yhat = forecast_series(model, hist, index_part, future_cov, device)
         part = index_part[["series_id", "timestamp"]].copy()
         part["prediction"] = yhat
         rows.append(part)
@@ -65,14 +71,6 @@ def backtest_last_horizon(
     horizon: int,
     device: torch.device,
 ) -> dict[str, float]:
-    """
-    Per-series backtest on the last `horizon` steps of train.csv.
-
-    Mimics competition inference:
-      - history = all rows before the final horizon block
-      - future covariates = known covariates in the final block
-      - labels = true targets in the final block
-    """
     frame = pd.read_csv(train_csv)
     frame["timestamp"] = pd.to_datetime(frame["timestamp"])
 
@@ -100,8 +98,9 @@ def backtest_last_horizon(
 
         history = sorted_group.iloc[:-horizon]
         future_index = sorted_group.iloc[-horizon:][["series_id", "timestamp"]]
+        future_cov = sorted_group.iloc[-horizon:]
         y_true = sorted_group.iloc[-horizon:][TARGET_COL].to_numpy(dtype=np.float64)
-        y_pred = forecast_series(model, history, future_index, sorted_group, device)
+        y_pred = forecast_series(model, history, future_index, future_cov, device)
         y_true_all.extend(y_true.tolist())
         y_pred_all.extend(y_pred.tolist())
 
@@ -109,7 +108,6 @@ def backtest_last_horizon(
 
 
 def score_with_labels(predictions: pd.DataFrame, labels_csv: Path) -> dict[str, float]:
-    """Score predictions against an external labels CSV (series_id, timestamp, target)."""
     labels = pd.read_csv(labels_csv)
     labels["timestamp"] = pd.to_datetime(labels["timestamp"])
     predictions = predictions.copy()
@@ -128,25 +126,15 @@ def main() -> None:
     parser.add_argument("--checkpoint", type=Path, default=Path("checkpoint.pt"))
     parser.add_argument("--train-csv", type=Path, default=None)
     parser.add_argument("--output-file", type=Path, default=Path("predictions.csv"))
-    parser.add_argument("--labels", type=Path, default=None, help="Optional labels CSV for direct scoring.")
-    parser.add_argument("--horizon", type=int, default=336, help="Backtest horizon per series.")
+    parser.add_argument("--labels", type=Path, default=None)
+    parser.add_argument("--horizon", type=int, default=336)
     parser.add_argument("--skip-inference", action="store_true")
     parser.add_argument("--skip-backtest", action="store_true")
     args = parser.parse_args()
 
     train_csv = args.train_csv or (args.data_dir / "train.csv")
-    device = torch.device(
-        "mps" if torch.backends.mps.is_available()
-        else "cuda" if torch.cuda.is_available()
-        else "cpu"
-    )
-    print(f"--> 当前验证使用的计算设备: {device}")
-
-    validation_input = args.data_dir / "validation_input.csv"
-    if validation_input.exists():
-        print(f"using validation_input: {validation_input}")
-    else:
-        print("warning: validation_input.csv not found; inference will fall back to train.csv")
+    device = resolve_device()
+    print(f"--> validation device: {device}")
 
     predictions: pd.DataFrame | None = None
     if not args.skip_inference:

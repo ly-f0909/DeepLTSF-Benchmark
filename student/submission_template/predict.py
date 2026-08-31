@@ -9,41 +9,25 @@ import numpy as np
 import pandas as pd
 import torch
 
+from src.data_io import (
+    get_series_future_cov,
+    get_series_history,
+    load_cov_frame,
+    load_forecast_index,
+    load_train_frame,
+)
 from src.features import COVARIATE_COLS, FEATURE_COLS, TARGET_COL, TARGET_IDX
 from src.model import ForecastModel
 
 
-def load_forecast_index(input_dir: Path) -> pd.DataFrame:
-    candidates = [
-        input_dir / "forecast_index_test.csv",
-        input_dir / "forecast_index_validation.csv",
-    ]
-    for forecast_index in candidates:
-        if forecast_index.exists():
-            return pd.read_csv(forecast_index)
-    expected = ", ".join(path.name for path in candidates)
-    raise FileNotFoundError(f"Expected one of {expected} in input_dir.")
-
-
-def load_history_frame(input_dir: Path) -> pd.DataFrame:
-    """Private eval uses test_input.csv; local validation uses validation_input.csv."""
-    candidates = [
-        input_dir / "test_input.csv",
-        input_dir / "validation_input.csv",
-        input_dir / "train.csv",
-    ]
-    for path in candidates:
-        if path.exists():
-            df = pd.read_csv(path)
-            df["timestamp"] = pd.to_datetime(df["timestamp"])
-            return df
-    raise FileNotFoundError(
-        f"Expected one of {[p.name for p in candidates]} in {input_dir}."
-    )
+def resolve_device() -> torch.device:
+    """Cloud/server friendly device selection."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
 
 
 def build_model_from_checkpoint(checkpoint: dict) -> ForecastModel:
-    """Instantiate TiDE ForecastModel from checkpoint config."""
     config = checkpoint.get("config", {})
     return ForecastModel(
         seq_len=config.get("seq_len", 336),
@@ -59,11 +43,7 @@ def build_model_from_checkpoint(checkpoint: dict) -> ForecastModel:
     )
 
 
-def extract_future_covariates(
-    future_cov_frame: pd.DataFrame,
-    start: int,
-    length: int,
-) -> np.ndarray:
+def extract_future_covariates(future_cov_frame: pd.DataFrame, start: int, length: int) -> np.ndarray:
     block = future_cov_frame.iloc[start : start + length]
     values = (
         block.reindex(columns=COVARIATE_COLS)
@@ -84,29 +64,41 @@ def build_past_window(values: np.ndarray, seq_len: int) -> np.ndarray:
     return values[-seq_len:]
 
 
+def compute_fixed_revin_stats(
+    model: ForecastModel,
+    true_target_window: np.ndarray,
+    device: torch.device,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Freeze RevIN stats from true historical targets (never from predictions)."""
+    if not model.use_revin:
+        return None, None
+    target = torch.from_numpy(true_target_window.astype(np.float32)).unsqueeze(0).to(device)
+    mean, stdev = model.revin.compute_stats(target)
+    return mean, stdev
+
+
 @torch.no_grad()
 def forecast_series(
     model: ForecastModel,
     history: pd.DataFrame,
     future_index: pd.DataFrame,
-    input_frame: pd.DataFrame,
+    future_cov_frame: pd.DataFrame,
     device: torch.device,
 ) -> np.ndarray:
     """Roll out 24-step TiDE blocks using known future covariates."""
     seq_len, pred_len = model.seq_len, model.pred_len
-    hist = history.sort_values("timestamp").copy()
-
-    future_cov_frame = (
-        input_frame.merge(future_index, on=["series_id", "timestamp"], how="inner")
-        .sort_values("timestamp")
-    )
 
     values = (
-        hist.reindex(columns=FEATURE_COLS)
+        history.reindex(columns=FEATURE_COLS)
         .astype(np.float32)
         .fillna(0.0)
         .to_numpy()
     )
+    if values.shape[0] == 0:
+        raise ValueError("History is empty; cannot forecast.")
+
+    anchor_target = build_past_window(values[:, TARGET_IDX], seq_len)
+    revin_mean, revin_stdev = compute_fixed_revin_stats(model, anchor_target, device)
 
     preds: list[float] = []
     horizon = len(future_index)
@@ -120,6 +112,8 @@ def forecast_series(
         pred_block = model(
             torch.from_numpy(x_past).unsqueeze(0).to(device),
             torch.from_numpy(x_future).unsqueeze(0).to(device),
+            revin_mean=revin_mean,
+            revin_stdev=revin_stdev,
         )[0].detach().cpu().numpy()[:take]
 
         preds.extend(pred_block.tolist())
@@ -144,12 +138,12 @@ def main() -> None:
     if not args.checkpoint.exists():
         raise FileNotFoundError(f"Missing checkpoint: {args.checkpoint}")
 
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-    print(f"--> 当前推理使用的计算设备: {device}")
+    device = resolve_device()
+    print(f"--> inference device: {device}")
 
     forecast_index = load_forecast_index(args.input_dir)
-    forecast_index["timestamp"] = pd.to_datetime(forecast_index["timestamp"])
-    history_frame = load_history_frame(args.input_dir)
+    train_frame = load_train_frame(args.input_dir)
+    cov_frame = load_cov_frame(args.input_dir)
 
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
@@ -167,13 +161,16 @@ def main() -> None:
 
     rows = []
     for series_id, index_part in forecast_index.groupby("series_id", sort=False):
-        hist = history_frame.loc[history_frame["series_id"].eq(series_id)]
         t0 = index_part["timestamp"].min()
-        hist = hist.loc[hist["timestamp"] < t0]
+        hist = get_series_history(train_frame, series_id, t0)
         if hist.empty:
-            raise ValueError(f"No history for series {series_id!r} before {t0}.")
+            raise ValueError(
+                f"No history in train.csv for series {series_id!r} before {t0}. "
+                "Historical targets must come from train.csv."
+            )
 
-        yhat = forecast_series(model, hist, index_part, history_frame, device)
+        future_cov = get_series_future_cov(cov_frame, train_frame, series_id, index_part)
+        yhat = forecast_series(model, hist, index_part, future_cov, device)
         part = index_part[["series_id", "timestamp"]].copy()
         part["prediction"] = yhat
         rows.append(part)
@@ -183,6 +180,7 @@ def main() -> None:
 
     args.output_file.parent.mkdir(parents=True, exist_ok=True)
     predictions.to_csv(args.output_file, index=False)
+    print(f"wrote {len(predictions)} predictions -> {args.output_file}")
 
 
 if __name__ == "__main__":

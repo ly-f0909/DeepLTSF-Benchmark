@@ -1,10 +1,9 @@
-"""TiDE forecaster with target-only RevIN and future covariate conditioning."""
+"""TiDE forecaster with target-only RevIN and future-known covariate conditioning."""
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from src.features import NUM_COVARIATES, TARGET_IDX
 
@@ -20,17 +19,29 @@ class RevIN(nn.Module):
             self.gamma = nn.Parameter(torch.ones(1))
             self.beta = nn.Parameter(torch.zeros(1))
 
-    def normalize(self, target: torch.Tensor) -> torch.Tensor:
-        """Normalize target history along the time dimension. target: [B, L]."""
-        self.mean = target.mean(dim=1, keepdim=True).detach()
-        self.stdev = torch.sqrt(target.var(dim=1, keepdim=True, unbiased=False) + self.eps).detach()
-        normed = (target - self.mean) / self.stdev
+    def compute_stats(self, target: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        mean = target.mean(dim=1, keepdim=True).detach()
+        stdev = torch.sqrt(target.var(dim=1, keepdim=True, unbiased=False) + self.eps).detach()
+        return mean, stdev
+
+    def normalize_with_stats(
+        self,
+        target: torch.Tensor,
+        mean: torch.Tensor,
+        stdev: torch.Tensor,
+    ) -> torch.Tensor:
+        normed = (target - mean) / stdev
         if self.affine:
             normed = normed * self.gamma + self.beta
         return normed
 
+    def normalize(self, target: torch.Tensor) -> torch.Tensor:
+        mean, stdev = self.compute_stats(target)
+        self.mean = mean
+        self.stdev = stdev
+        return self.normalize_with_stats(target, mean, stdev)
+
     def denormalize(self, target: torch.Tensor) -> torch.Tensor:
-        """Denormalize predicted target values. target: [B, pred_len]."""
         out = target
         if self.affine:
             out = (out - self.beta) / self.gamma
@@ -91,7 +102,6 @@ class ForecastModel(nn.Module):
         if use_revin:
             self.revin = RevIN(affine=True)
 
-        # Past path uses normalized target + raw covariates.
         self.past_feat_proj = nn.Linear(num_covariates + 1, hidden_dim)
         self.future_feat_proj = nn.Linear(num_covariates, hidden_dim)
 
@@ -128,11 +138,24 @@ class ForecastModel(nn.Module):
         )
         return past_cov, past_target
 
-    def forward(self, x_past: torch.Tensor, x_future: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x_past: torch.Tensor,
+        x_future: torch.Tensor,
+        revin_mean: torch.Tensor | None = None,
+        revin_stdev: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         past_cov, past_target = self._split_past(x_past)
 
         if self.use_revin:
-            past_target_norm = self.revin.normalize(past_target)
+            if revin_mean is not None and revin_stdev is not None:
+                past_target_norm = self.revin.normalize_with_stats(
+                    past_target, revin_mean, revin_stdev
+                )
+                self.revin.mean = revin_mean
+                self.revin.stdev = revin_stdev
+            else:
+                past_target_norm = self.revin.normalize(past_target)
         else:
             past_target_norm = past_target
 

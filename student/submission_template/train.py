@@ -22,6 +22,15 @@ def set_seed(seed: int = 42) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def resolve_device() -> torch.device:
+    """Cloud/server friendly device selection."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
 
 
 def build_loss_fn(loss_name: str) -> nn.Module:
@@ -87,7 +96,7 @@ def main() -> None:
     parser.add_argument("--num_encoder_layers", type=int, default=2)
     parser.add_argument("--num_decoder_layers", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.2)
-    parser.add_argument("--batch_size", type=int, default=512)
+    parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--min_lr", type=float, default=1e-5)
@@ -95,16 +104,12 @@ def main() -> None:
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--loss", choices=["smooth_l1", "l1", "huber"], default="smooth_l1")
     parser.add_argument("--use_revin", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--num_workers", type=int, default=4)
     args = parser.parse_args()
 
     set_seed(42)
-    device = torch.device(
-        "mps" if torch.backends.mps.is_available()
-        else "cuda" if torch.cuda.is_available()
-        else "cpu"
-    )
-    print(f"--> 当前训练使用的计算设备: {device}")
+    device = resolve_device()
+    print(f"--> training device: {device}")
 
     raw = pd.read_csv(args.train_csv)
     train_df, val_df = chronological_split(raw, 0.8)
@@ -115,20 +120,16 @@ def main() -> None:
     val_ds = TiDEDataset(val_df, args.seq_len, args.pred_len)
     print(f"train windows={len(train_ds)} val windows={len(val_ds)}")
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=device.type == "cuda",
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=device.type == "cuda",
-    )
+    loader_kwargs: dict = {
+        "batch_size": args.batch_size,
+        "num_workers": args.num_workers,
+        "pin_memory": device.type == "cuda",
+    }
+    if args.num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+
+    train_loader = DataLoader(train_ds, shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(val_ds, shuffle=False, **loader_kwargs)
 
     config = build_config(args)
     model = ForecastModel(
@@ -153,11 +154,11 @@ def main() -> None:
         model.train()
         running, n = 0.0, 0
         for x_past, x_future, y_target in train_loader:
-            x_past = x_past.to(device)
-            x_future = x_future.to(device)
-            y_target = y_target.to(device)
+            x_past = x_past.to(device, non_blocking=True)
+            x_future = x_future.to(device, non_blocking=True)
+            y_target = y_target.to(device, non_blocking=True)
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             pred = model(x_past, x_future)
             loss = loss_fn(pred, y_target)
             loss.backward()
@@ -172,19 +173,14 @@ def main() -> None:
         current_lr = scheduler.get_last_lr()[0]
         print(
             f"epoch {epoch:02d}  lr={current_lr:.2e}  "
-            f"train_{args.loss}={train_loss:.6f}  val_{args.loss}={val_loss:.6f}"
+            f"train_{args.loss}={train_loss:.6f}  val_{args.loss}={val_loss:.6f}",
+            flush=True,
         )
 
         if val_loss < best_val:
             best_val = val_loss
-            torch.save(
-                {
-                    "state_dict": model.state_dict(),
-                    "config": config,
-                },
-                args.checkpoint,
-            )
-            print(f"  saved best -> {args.checkpoint} (val_{args.loss}={best_val:.6f})")
+            torch.save({"state_dict": model.state_dict(), "config": config}, args.checkpoint)
+            print(f"  saved best -> {args.checkpoint} (val_{args.loss}={best_val:.6f})", flush=True)
 
     print(f"done. best_val_{args.loss}={best_val:.6f}")
 
