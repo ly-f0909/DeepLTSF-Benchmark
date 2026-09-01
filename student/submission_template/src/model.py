@@ -142,20 +142,11 @@ class ForecastModel(nn.Module):
         self,
         x_past: torch.Tensor,
         x_future: torch.Tensor,
-        revin_mean: torch.Tensor | None = None,
-        revin_stdev: torch.Tensor | None = None,
     ) -> torch.Tensor:
         past_cov, past_target = self._split_past(x_past)
 
         if self.use_revin:
-            if revin_mean is not None and revin_stdev is not None:
-                past_target_norm = self.revin.normalize_with_stats(
-                    past_target, revin_mean, revin_stdev
-                )
-                self.revin.mean = revin_mean
-                self.revin.stdev = revin_stdev
-            else:
-                past_target_norm = self.revin.normalize(past_target)
+            past_target_norm = self.revin.normalize(past_target)
         else:
             past_target_norm = past_target
 
@@ -172,6 +163,8 @@ class ForecastModel(nn.Module):
         out_norm = mlp_out + skip_out
 
         if self.use_revin:
+            if not hasattr(self.revin, "mean") or not hasattr(self.revin, "stdev"):
+                raise RuntimeError("RevIN statistics missing before denormalize.")
             return self.revin.denormalize(out_norm)
 
         return out_norm

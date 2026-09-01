@@ -6,6 +6,52 @@ from pathlib import Path
 
 import pandas as pd
 
+SUBMISSION_ROOT = Path(__file__).resolve().parents[1]
+
+
+def resolve_data_dir(explicit: Path | None = None) -> Path:
+    """Find a directory that contains train.csv."""
+    if explicit is not None:
+        data_dir = explicit.expanduser().resolve()
+        if (data_dir / "train.csv").exists():
+            return data_dir
+        if data_dir.name == "train.csv" and data_dir.exists():
+            return data_dir.parent
+        raise FileNotFoundError(
+            f"train.csv not found under {data_dir}. "
+            "Pass --data-dir to the folder containing train.csv, "
+            "or --train_csv to the train.csv file directly."
+        )
+
+    candidates = [
+        SUBMISSION_ROOT / "data",
+        SUBMISSION_ROOT.parent.parent / "data",
+        SUBMISSION_ROOT / "../../data",
+        Path.cwd() / "data",
+        Path.cwd().parent / "data",
+    ]
+    for candidate in candidates:
+        data_dir = candidate.expanduser().resolve()
+        if (data_dir / "train.csv").exists():
+            return data_dir
+
+    raise FileNotFoundError(
+        "Could not locate train.csv. Download the HF dataset and either:\n"
+        "  1) place train.csv in a data/ folder next to train.py, or\n"
+        "  2) run: python train.py --data-dir /your/actual/data/folder\n"
+        "  3) run: python train.py --train_csv /your/actual/data/train.csv"
+    )
+
+
+def resolve_train_csv(train_csv: Path | None = None, data_dir: Path | None = None) -> Path:
+    """Resolve train.csv from an explicit file path or data directory."""
+    if train_csv is not None:
+        path = train_csv.expanduser().resolve()
+        if path.is_file():
+            return path
+        raise FileNotFoundError(f"train.csv not found: {path}")
+    return resolve_data_dir(data_dir) / "train.csv"
+
 
 def load_train_frame(input_dir: Path) -> pd.DataFrame:
     """Load train.csv which contains historical targets and covariates."""

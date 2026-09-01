@@ -10,3 +10,9 @@ epoch 03  lr=9.76e-04  train_smooth_l1=1.439646  val_smooth_l1=1.441660
   saved best -> checkpoint.pt (val_smooth_l1=1.441660)
 epoch 04  lr=9.57e-04  train_smooth_l1=1.380214  val_smooth_l1=1.337744
   saved best -> checkpoint.pt (val_smooth_l1=1.337744)
+epoch 05  lr=9.34e-04  train_smooth_l1=1.376042  val_smooth_l1=1.372726
+epoch 06  lr=9.05e-04  train_smooth_l1=1.351893  val_smooth_l1=1.385986
+epoch 07  lr=8.73e-04  train_smooth_l1=1.330598  val_smooth_l1=1.317940
+  saved best -> checkpoint.pt (val_smooth_l1=1.317940)
+epoch 08  lr=8.36e-04  train_smooth_l1=1.296628  val_smooth_l1=1.280992
+  saved best -> checkpoint.pt (val_smooth_l1=1.280992)
