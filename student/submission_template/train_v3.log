@@ -40,3 +40,7 @@ epoch 24  lr=1.05e-04  train_smooth_l1=0.899787  val_smooth_l1=1.158939
 epoch 25  lr=7.63e-05  train_smooth_l1=0.891609  val_smooth_l1=1.152531
 epoch 26  lr=5.28e-05  train_smooth_l1=0.884754  val_smooth_l1=1.148280
 epoch 27  lr=3.42e-05  train_smooth_l1=0.879038  val_smooth_l1=1.152917
+epoch 28  lr=2.08e-05  train_smooth_l1=0.874812  val_smooth_l1=1.149149
+epoch 29  lr=1.27e-05  train_smooth_l1=0.872347  val_smooth_l1=1.148927
+epoch 30  lr=1.00e-05  train_smooth_l1=0.870369  val_smooth_l1=1.145889
+done. best_val_smooth_l1=1.145515

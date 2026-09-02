@@ -1,4 +1,4 @@
-"""Train TiDE with engineered features, longer lookback, warmup LR, and multi-seed support."""
+"""Train TiDE with engineered features, rollout loss, warmup LR, and multi-seed support."""
 
 from __future__ import annotations
 
@@ -15,10 +15,8 @@ from torch.utils.data import DataLoader
 
 from src.data_io import resolve_train_csv
 from src.dataset import TiDEDataset, chronological_split
-from src.features import COVARIATE_COLS, FEATURE_COLS, NUM_COVARIATES, NUM_FEATURES, TARGET_COL
+from src.features import COVARIATE_COLS, FEATURE_COLS, NUM_COVARIATES, NUM_FEATURES, TARGET_COL, TARGET_IDX
 from src.model import ForecastModel
-
-DEFAULT_SEEDS = (42, 2024, 777)
 
 
 def set_seed(seed: int = 42) -> None:
@@ -94,21 +92,78 @@ def build_scheduler(
     )
 
 
+def advance_past_window(
+    x_past: torch.Tensor,
+    x_future_block: torch.Tensor,
+    pred_block: torch.Tensor,
+    *,
+    target_idx: int = TARGET_IDX,
+    n_covariates: int = NUM_COVARIATES,
+) -> torch.Tensor:
+    """
+    Shift lookback by pred_len and append one forecast block.
+
+    Uses known future covariates + predicted target (no future target leakage).
+    """
+    pred_len = pred_block.size(1)
+    batch = x_past.size(0)
+    n_features = x_past.size(2)
+    appended = x_past.new_zeros(batch, pred_len, n_features)
+    appended[:, :, :n_covariates] = x_future_block
+    appended[:, :, target_idx] = pred_block
+    return torch.cat([x_past[:, pred_len:, :], appended], dim=1)
+
+
+def compute_rollout_loss(
+    model: ForecastModel,
+    x_past: torch.Tensor,
+    x_future_full: torch.Tensor,
+    y_full: torch.Tensor,
+    loss_fn: nn.Module,
+    *,
+    pred_len: int,
+    rollout_steps: int,
+    detach_feedback: bool = True,
+) -> torch.Tensor:
+    """
+    Multi-step AR loss over known future covariates.
+
+    Step k uses covariates y-window [k*pred_len:(k+1)*pred_len] only.
+    Predicted targets are fed back into the lookback for the next step.
+    """
+    total_loss = x_past.new_zeros(())
+    past = x_past
+    for step in range(rollout_steps):
+        start = step * pred_len
+        end = start + pred_len
+        fut = x_future_full[:, start:end, :]
+        y = y_full[:, start:end]
+        pred = model(past, fut)
+        total_loss = total_loss + loss_fn(pred, y)
+        if step + 1 < rollout_steps:
+            feed = pred.detach() if detach_feedback else pred
+            past = advance_past_window(past, fut, feed)
+    return total_loss / float(rollout_steps)
+
+
 @torch.no_grad()
 def evaluate(
     model: ForecastModel,
     loader: DataLoader,
     loss_fn: nn.Module,
     device: torch.device,
+    *,
+    pred_len: int,
 ) -> tuple[float, dict[str, float]]:
+    """Evaluate on the first pred_len block only (stable single-step metric)."""
     model.eval()
     total, n = 0.0, 0
     pred_all: list[np.ndarray] = []
     true_all: list[np.ndarray] = []
     for x_past, x_future, y_target in loader:
         x_past = x_past.to(device)
-        x_future = x_future.to(device)
-        y_target = y_target.to(device)
+        x_future = x_future[:, :pred_len, :].to(device)
+        y_target = y_target[:, :pred_len].to(device)
         pred = model(x_past, x_future)
         loss = loss_fn(pred, y_target)
         total += loss.item() * x_past.size(0)
@@ -152,6 +207,8 @@ def build_config(args: argparse.Namespace, seed: int) -> dict:
         "seed": seed,
         "scheduler": args.scheduler,
         "warmup_epochs": args.warmup_epochs,
+        "rollout_steps": args.rollout_steps,
+        "rollout_detach_feedback": args.rollout_detach_feedback,
     }
 
 
@@ -198,7 +255,11 @@ def train_one_seed(
     )
 
     best_val = float("inf")
-    print(f"\n===== training seed={seed} -> {checkpoint_path} =====", flush=True)
+    print(
+        f"\n===== training seed={seed} rollout_steps={args.rollout_steps} "
+        f"detach_feedback={args.rollout_detach_feedback} -> {checkpoint_path} =====",
+        flush=True,
+    )
     for epoch in range(1, args.epochs + 1):
         model.train()
         running, n = 0.0, 0
@@ -208,8 +269,16 @@ def train_one_seed(
             y_target = y_target.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
-            pred = model(x_past, x_future)
-            loss = loss_fn(pred, y_target)
+            loss = compute_rollout_loss(
+                model,
+                x_past,
+                x_future,
+                y_target,
+                loss_fn,
+                pred_len=args.pred_len,
+                rollout_steps=args.rollout_steps,
+                detach_feedback=args.rollout_detach_feedback,
+            )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.max_grad_norm)
             optimizer.step()
@@ -218,7 +287,9 @@ def train_one_seed(
 
         scheduler.step()
         train_loss = running / max(n, 1)
-        val_loss, val_stats = evaluate(model, val_loader, loss_fn, device)
+        val_loss, val_stats = evaluate(
+            model, val_loader, loss_fn, device, pred_len=args.pred_len
+        )
         current_lr = scheduler.get_last_lr()[0]
         print(
             f"[seed {seed}] epoch {epoch:02d}  lr={current_lr:.2e}  "
@@ -263,6 +334,19 @@ def main() -> None:
     )
     parser.add_argument("--seq_len", type=int, default=504, choices=[168, 336, 504, 672])
     parser.add_argument("--pred_len", type=int, default=24)
+    parser.add_argument(
+        "--rollout-steps",
+        type=int,
+        default=3,
+        choices=[1, 2, 3],
+        help="Autoregressive training blocks (1=single 24-step, 3=72-step rollout).",
+    )
+    parser.add_argument(
+        "--rollout-detach-feedback",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Detach predicted targets when building the next lookback (saves memory).",
+    )
     parser.add_argument("--hidden_dim", type=int, default=256)
     parser.add_argument("--num_encoder_layers", type=int, default=2)
     parser.add_argument("--num_decoder_layers", type=int, default=2)
@@ -276,8 +360,6 @@ def main() -> None:
         "--scheduler",
         choices=["cosine_warmup", "cosine_warm_restarts"],
         default="cosine_warmup",
-        help="cosine_warmup: Linear warmup then CosineAnnealingLR; "
-        "cosine_warm_restarts: CosineAnnealingWarmRestarts.",
     )
     parser.add_argument("--restart_period", type=int, default=10)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
@@ -293,6 +375,11 @@ def main() -> None:
     print(f"--> training device: {device}")
     print(f"--> seeds: {seeds}")
     print(f"--> feature dims: num_features={NUM_FEATURES} num_covariates={NUM_COVARIATES}")
+    print(
+        f"--> rollout_steps={args.rollout_steps} "
+        f"detach_feedback={args.rollout_detach_feedback}",
+        flush=True,
+    )
 
     train_csv = resolve_train_csv(args.train_csv, args.data_dir)
     print(f"using train_csv: {train_csv}")
@@ -300,9 +387,12 @@ def main() -> None:
     train_df, val_df = chronological_split(raw, 0.8)
     print(f"train rows={len(train_df)} val rows={len(val_df)}")
 
-    print("materializing training windows into memory tensors...", flush=True)
-    train_ds = TiDEDataset(train_df, args.seq_len, args.pred_len)
-    val_ds = TiDEDataset(val_df, args.seq_len, args.pred_len)
+    print("building indexed datasets...", flush=True)
+    train_ds = TiDEDataset(
+        train_df, args.seq_len, args.pred_len, rollout_steps=args.rollout_steps
+    )
+    # Keep validation on single-block metric for stable early stopping.
+    val_ds = TiDEDataset(val_df, args.seq_len, args.pred_len, rollout_steps=1)
     print(f"train windows={len(train_ds)} val windows={len(val_ds)}")
 
     loader_kwargs: dict = {
@@ -335,9 +425,12 @@ def main() -> None:
     if multi_seed:
         print(
             "ensemble predict example:\n"
-            f"  python predict.py --input_dir ../../data --checkpoints "
+            "  python predict_ensemble.py --input_dir ../../data --checkpoints "
             + ",".join(str(path) for _, _, path in results)
-            + " --output_file predictions.csv"
+            + " --checkpoint-weights "
+            + ",".join(["1"] * len(results))
+            + " --tide-weight 0.8 --seasonal-weight 0.2 --calibrate "
+            "--output_file predictions.csv"
         )
 
 
