@@ -257,23 +257,31 @@ def fit_series_calibration(
     train_frame: pd.DataFrame,
     device: torch.device,
     *,
-    horizon: int = 336,
+    horizon: int = 168,
     min_points: int = 48,
     a_clip: tuple[float, float] = (0.5, 1.5),
+    mode: str = "bias",
+    shrinkage: float = 0.5,
+    b_clip: float = 3.0,
+    fit_models: list[tuple[Path, ForecastModel, dict]] | None = None,
 ) -> dict[str, tuple[float, float]]:
     """
-    Fit y ≈ a * pred + b per series on the last `horizon` train steps.
+    Fit per-series correction on the last `horizon` train steps.
 
-    Uses weighted ensemble predictions on a chronological backtest block.
+    Calibration is fit on TiDE ensemble predictions only (before seasonal blend).
     No future leakage: history is strictly before the calibration block.
     """
     coeffs: dict[str, tuple[float, float]] = {}
     train_frame = train_frame.copy()
     train_frame["timestamp"] = pd.to_datetime(train_frame["timestamp"])
+    fit_models = fit_models or models
+    fit_weights = weights[: len(fit_models)]
+    if fit_weights.sum() > 0:
+        fit_weights = fit_weights / fit_weights.sum()
 
     print(
-        f"fitting per-series calibration on last {horizon} train steps "
-        f"(a clipped to {a_clip})...",
+        f"fitting per-series calibration ({mode}) on last {horizon} train steps "
+        f"using {len(fit_models)} model(s)...",
         flush=True,
     )
 
@@ -289,7 +297,7 @@ def fit_series_calibration(
         y_true = future_block[TARGET_COL].to_numpy(dtype=np.float64)
 
         member_preds: list[np.ndarray] = []
-        for (_, model, _), weight in zip(models, weights):
+        for (_, model, _), weight in zip(fit_models, fit_weights):
             y_hat = forecast_series(
                 model,
                 history,
@@ -304,12 +312,20 @@ def fit_series_calibration(
             coeffs[str(series_id)] = (1.0, 0.0)
             continue
 
-        # Least squares: [pred, 1] @ [a, b] = y_true
+        strength = min(1.0, len(y_pred) / max(float(horizon), 1.0)) * shrinkage
+        if mode == "bias":
+            raw_b = float(np.mean(y_true - y_pred))
+            b = float(np.clip(strength * raw_b, -b_clip, b_clip))
+            coeffs[str(series_id)] = (1.0, b)
+            continue
+
         design = np.column_stack([y_pred, np.ones_like(y_pred)])
         try:
             ab, _, _, _ = np.linalg.lstsq(design, y_true, rcond=None)
-            a = float(np.clip(ab[0], a_clip[0], a_clip[1]))
-            b = float(ab[1])
+            a_raw = float(ab[0])
+            b_raw = float(ab[1])
+            a = float(np.clip(1.0 + strength * (a_raw - 1.0), a_clip[0], a_clip[1]))
+            b = float(np.clip(strength * b_raw, -b_clip, b_clip))
         except np.linalg.LinAlgError:
             a, b = 1.0, 0.0
         coeffs[str(series_id)] = (a, b)
@@ -360,9 +376,28 @@ def main() -> None:
     parser.add_argument(
         "--calibrate",
         action="store_true",
-        help="Fit/apply per-series linear calibration from train tail backtest.",
+        help="Optional: fit/apply per-series bias/linear correction on TiDE before seasonal blend.",
     )
-    parser.add_argument("--calibrate-horizon", type=int, default=336)
+    parser.add_argument(
+        "--calibrate-mode",
+        choices=["bias", "linear"],
+        default="bias",
+        help="bias=intercept-only (fast/safer); linear=slope+intercept.",
+    )
+    parser.add_argument(
+        "--calibrate-horizon",
+        type=int,
+        default=168,
+        help="Train-tail backtest length for calibration fit (default 168 for speed).",
+    )
+    parser.add_argument(
+        "--calibrate-fit-models",
+        type=int,
+        default=1,
+        help="Use only the first N checkpoints when fitting calibration (speed).",
+    )
+    parser.add_argument("--calibrate-shrinkage", type=float, default=0.5)
+    parser.add_argument("--calibrate-b-max", type=float, default=3.0)
     parser.add_argument("--calibrate-a-min", type=float, default=0.5)
     parser.add_argument("--calibrate-a-max", type=float, default=1.5)
     args = parser.parse_args()
@@ -394,21 +429,33 @@ def main() -> None:
 
     models = load_models(checkpoint_paths, device)
 
+    tide_pred = run_weighted_tide_ensemble(
+        models, ckpt_weights, forecast_index, train_frame, cov_frame, device
+    )
+    tide_pred = np.clip(tide_pred, 0.0, None)
+
     coeffs: dict[str, tuple[float, float]] | None = None
     if args.calibrate:
+        fit_n = max(1, min(args.calibrate_fit_models, len(models)))
+        fit_models = models[:fit_n]
+        fit_weights = ckpt_weights[:fit_n]
         coeffs = fit_series_calibration(
             models,
             ckpt_weights,
             train_frame,
             device,
             horizon=args.calibrate_horizon,
+            mode=args.calibrate_mode,
+            shrinkage=args.calibrate_shrinkage,
+            b_clip=args.calibrate_b_max,
             a_clip=(args.calibrate_a_min, args.calibrate_a_max),
+            fit_models=fit_models,
         )
-
-    tide_pred = run_weighted_tide_ensemble(
-        models, ckpt_weights, forecast_index, train_frame, cov_frame, device
-    )
-    tide_pred = np.clip(tide_pred, 0.0, None)
+        tide_df = forecast_index[["series_id", "timestamp"]].copy()
+        tide_df["prediction"] = tide_pred
+        print("applying per-series calibration to TiDE before seasonal blend...", flush=True)
+        tide_df = apply_series_calibration(tide_df, coeffs)
+        tide_pred = tide_df["prediction"].to_numpy(dtype=np.float64)
 
     if seasonal_w > 0:
         print("computing seasonal_mean baseline...", flush=True)
@@ -430,10 +477,6 @@ def main() -> None:
 
     predictions = forecast_index[["series_id", "timestamp"]].copy()
     predictions["prediction"] = blended
-
-    if coeffs is not None:
-        print("applying per-series linear calibration...", flush=True)
-        predictions = apply_series_calibration(predictions, coeffs)
 
     predictions["prediction"] = np.clip(
         predictions["prediction"].to_numpy(dtype=np.float64), 0.0, None

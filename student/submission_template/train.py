@@ -187,6 +187,8 @@ def evaluate(
 def build_config(args: argparse.Namespace, seed: int) -> dict:
     return {
         "model_type": "tide",
+        "full_fit": args.full_fit,
+        "epochs": args.epochs,
         "seq_len": args.seq_len,
         "pred_len": args.pred_len,
         "num_features": NUM_FEATURES,
@@ -223,7 +225,7 @@ def train_one_seed(
     *,
     seed: int,
     train_loader: DataLoader,
-    val_loader: DataLoader,
+    val_loader: DataLoader | None,
     device: torch.device,
     checkpoint_path: Path,
 ) -> float:
@@ -255,9 +257,12 @@ def train_one_seed(
     )
 
     best_val = float("inf")
+    final_train_loss = float("inf")
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     print(
         f"\n===== training seed={seed} rollout_steps={args.rollout_steps} "
-        f"detach_feedback={args.rollout_detach_feedback} -> {checkpoint_path} =====",
+        f"detach_feedback={args.rollout_detach_feedback} "
+        f"full_fit={args.full_fit} -> {checkpoint_path} =====",
         flush=True,
     )
     for epoch in range(1, args.epochs + 1):
@@ -287,10 +292,22 @@ def train_one_seed(
 
         scheduler.step()
         train_loss = running / max(n, 1)
+        final_train_loss = train_loss
+        current_lr = scheduler.get_last_lr()[0]
+
+        if args.full_fit:
+            print(
+                f"[seed {seed}] epoch {epoch:02d}/{args.epochs:02d}  "
+                f"lr={current_lr:.2e}  train_{args.loss}={train_loss:.6f}",
+                flush=True,
+            )
+            continue
+
+        if val_loader is None:
+            raise RuntimeError("val_loader is required when --full_fit is not enabled.")
         val_loss, val_stats = evaluate(
             model, val_loader, loss_fn, device, pred_len=args.pred_len
         )
-        current_lr = scheduler.get_last_lr()[0]
         print(
             f"[seed {seed}] epoch {epoch:02d}  lr={current_lr:.2e}  "
             f"train_{args.loss}={train_loss:.6f}  val_{args.loss}={val_loss:.6f}",
@@ -312,6 +329,15 @@ def train_one_seed(
                 flush=True,
             )
 
+    if args.full_fit:
+        torch.save({"state_dict": model.state_dict(), "config": config}, checkpoint_path)
+        print(
+            f"[seed {seed}] full fit complete; saved final epoch {args.epochs} "
+            f"-> {checkpoint_path} (train_{args.loss}={final_train_loss:.6f})",
+            flush=True,
+        )
+        return final_train_loss
+
     print(f"[seed {seed}] done. best_val_{args.loss}={best_val:.6f}", flush=True)
     return best_val
 
@@ -325,7 +351,23 @@ def main() -> None:
         help="Directory containing train.csv (default: ../../data).",
     )
     parser.add_argument("--train_csv", type=Path, default=None)
-    parser.add_argument("--checkpoint", type=Path, default=Path("checkpoint.pt"))
+    parser.add_argument(
+        "--full_fit",
+        action="store_true",
+        help="Train on 100%% of the data, skip validation, and save the final epoch.",
+    )
+    parser.add_argument(
+        "--save_name",
+        type=Path,
+        default=Path("checkpoint.pt"),
+        help="Checkpoint output path (default: checkpoint.pt).",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=None,
+        help="Deprecated alias for --save_name; retained for backward compatibility.",
+    )
     parser.add_argument(
         "--seeds",
         type=str,
@@ -337,9 +379,10 @@ def main() -> None:
     parser.add_argument(
         "--rollout-steps",
         type=int,
-        default=3,
+        default=1,
         choices=[1, 2, 3],
-        help="Autoregressive training blocks (1=single 24-step, 3=72-step rollout).",
+        help="Autoregressive training blocks (1=single 24-step, 3=72-step rollout). "
+        "Default 1 matches the best OA scores; use 2-3 only after single-step converges.",
     )
     parser.add_argument(
         "--rollout-detach-feedback",
@@ -364,7 +407,7 @@ def main() -> None:
     parser.add_argument("--restart_period", type=int, default=10)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
-    parser.add_argument("--loss", choices=["smooth_l1", "l1", "huber"], default="smooth_l1")
+    parser.add_argument("--loss", choices=["smooth_l1", "l1", "huber"], default="l1")
     parser.add_argument("--use_revin", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--num_workers", type=int, default=2)
     args = parser.parse_args()
@@ -384,16 +427,28 @@ def main() -> None:
     train_csv = resolve_train_csv(args.train_csv, args.data_dir)
     print(f"using train_csv: {train_csv}")
     raw = pd.read_csv(train_csv)
-    train_df, val_df = chronological_split(raw, 0.8)
-    print(f"train rows={len(train_df)} val rows={len(val_df)}")
+    if args.full_fit:
+        train_df = raw
+        val_df = None
+        print(f"full_fit enabled: train rows={len(train_df)} val rows=0")
+    else:
+        train_df, val_df = chronological_split(raw, 0.8)
+        print(f"train rows={len(train_df)} val rows={len(val_df)}")
 
     print("building indexed datasets...", flush=True)
     train_ds = TiDEDataset(
         train_df, args.seq_len, args.pred_len, rollout_steps=args.rollout_steps
     )
-    # Keep validation on single-block metric for stable early stopping.
-    val_ds = TiDEDataset(val_df, args.seq_len, args.pred_len, rollout_steps=1)
-    print(f"train windows={len(train_ds)} val windows={len(val_ds)}")
+    # Keep validation on a single block for stable best-checkpoint selection.
+    val_ds = (
+        None
+        if val_df is None
+        else TiDEDataset(val_df, args.seq_len, args.pred_len, rollout_steps=1)
+    )
+    print(
+        f"train windows={len(train_ds)} "
+        f"val windows={0 if val_ds is None else len(val_ds)}"
+    )
 
     loader_kwargs: dict = {
         "batch_size": args.batch_size,
@@ -404,11 +459,16 @@ def main() -> None:
         loader_kwargs["persistent_workers"] = True
 
     train_loader = DataLoader(train_ds, shuffle=True, **loader_kwargs)
-    val_loader = DataLoader(val_ds, shuffle=False, **loader_kwargs)
+    val_loader = (
+        None
+        if val_ds is None
+        else DataLoader(val_ds, shuffle=False, **loader_kwargs)
+    )
 
     results: list[tuple[int, float, Path]] = []
+    base_checkpoint = args.checkpoint or args.save_name
     for seed in seeds:
-        ckpt = checkpoint_path_for_seed(args.checkpoint, seed, multi_seed)
+        ckpt = checkpoint_path_for_seed(base_checkpoint, seed, multi_seed)
         best_val = train_one_seed(
             args,
             seed=seed,
@@ -421,15 +481,14 @@ def main() -> None:
 
     print("\n===== seed summary =====")
     for seed, best_val, ckpt in results:
-        print(f"seed={seed} best_val_{args.loss}={best_val:.6f} checkpoint={ckpt}")
+        metric_name = f"final_train_{args.loss}" if args.full_fit else f"best_val_{args.loss}"
+        print(f"seed={seed} {metric_name}={best_val:.6f} checkpoint={ckpt}")
     if multi_seed:
         print(
             "ensemble predict example:\n"
             "  python predict_ensemble.py --input_dir ../../data --checkpoints "
             + ",".join(str(path) for _, _, path in results)
-            + " --checkpoint-weights "
-            + ",".join(["1"] * len(results))
-            + " --tide-weight 0.8 --seasonal-weight 0.2 --calibrate "
+            + " --tide-weight 0.8 --seasonal-weight 0.2 "
             "--output_file predictions.csv"
         )
 
