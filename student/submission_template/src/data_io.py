@@ -37,9 +37,9 @@ def resolve_data_dir(explicit: Path | None = None) -> Path:
 
     raise FileNotFoundError(
         "Could not locate train.csv. Download the HF dataset and either:\n"
-        "  1) place train.csv in a data/ folder next to train.py, or\n"
-        "  2) run: python train.py --data-dir /your/actual/data/folder\n"
-        "  3) run: python train.py --train_csv /your/actual/data/train.csv"
+        "  1) place train.csv under ../../data relative to submission_template, or\n"
+        "  2) run: python train.py --data-dir ../../data\n"
+        "  3) run: python train.py --train_csv ../../data/train.csv"
     )
 
 

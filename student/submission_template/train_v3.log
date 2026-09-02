@@ -32,3 +32,11 @@ epoch 17  lr=4.02e-04  train_smooth_l1=1.013538  val_smooth_l1=1.176305
 epoch 18  lr=3.52e-04  train_smooth_l1=0.990462  val_smooth_l1=1.145515
   saved best -> checkpoint.pt (val_smooth_l1=1.145515)
 epoch 19  lr=3.04e-04  train_smooth_l1=0.968141  val_smooth_l1=1.155653
+epoch 20  lr=2.58e-04  train_smooth_l1=0.950090  val_smooth_l1=1.163144
+epoch 21  lr=2.14e-04  train_smooth_l1=0.933774  val_smooth_l1=1.157106
+epoch 22  lr=1.74e-04  train_smooth_l1=0.920937  val_smooth_l1=1.158412
+epoch 23  lr=1.37e-04  train_smooth_l1=0.910125  val_smooth_l1=1.164008
+epoch 24  lr=1.05e-04  train_smooth_l1=0.899787  val_smooth_l1=1.158939
+epoch 25  lr=7.63e-05  train_smooth_l1=0.891609  val_smooth_l1=1.152531
+epoch 26  lr=5.28e-05  train_smooth_l1=0.884754  val_smooth_l1=1.148280
+epoch 27  lr=3.42e-05  train_smooth_l1=0.879038  val_smooth_l1=1.152917

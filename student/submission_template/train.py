@@ -247,7 +247,12 @@ def train_one_seed(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-dir", type=Path, default=None)
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=Path("../../data"),
+        help="Directory containing train.csv (default: ../../data).",
+    )
     parser.add_argument("--train_csv", type=Path, default=None)
     parser.add_argument("--checkpoint", type=Path, default=Path("checkpoint.pt"))
     parser.add_argument(
@@ -262,7 +267,7 @@ def main() -> None:
     parser.add_argument("--num_encoder_layers", type=int, default=2)
     parser.add_argument("--num_decoder_layers", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.2)
-    parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--min_lr", type=float, default=1e-5)
@@ -279,7 +284,7 @@ def main() -> None:
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--loss", choices=["smooth_l1", "l1", "huber"], default="smooth_l1")
     parser.add_argument("--use_revin", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--num_workers", type=int, default=2)
     args = parser.parse_args()
 
     seeds = parse_seeds(args.seeds)
@@ -330,7 +335,7 @@ def main() -> None:
     if multi_seed:
         print(
             "ensemble predict example:\n"
-            f"  python predict.py --checkpoints "
+            f"  python predict.py --input_dir ../../data --checkpoints "
             + ",".join(str(path) for _, _, path in results)
             + " --output_file predictions.csv"
         )

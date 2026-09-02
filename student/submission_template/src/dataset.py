@@ -1,4 +1,4 @@
-"""Pre-materialized TiDE dataset with engineered features and in-memory tensors."""
+"""Memory-efficient TiDE dataset: store per-series tensors, slice windows on demand."""
 
 from __future__ import annotations
 
@@ -10,50 +10,11 @@ from torch.utils.data import Dataset
 from src.features import COVARIATE_COLS, FEATURE_COLS, TARGET_COL, enrich_features
 
 
-def _build_series_windows(
-    features: np.ndarray,
-    covariates: np.ndarray,
-    target: np.ndarray,
-    seq_len: int,
-    pred_len: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Build aligned windows for one series.
-
-    For anchor time t (= start + seq_len):
-      x_past   = features[t - seq_len : t]
-      x_future = covariates[t : t + pred_len]   (known future covariates only, NO target)
-      y_target = target[t : t + pred_len]
-    """
-    n = target.shape[0]
-    n_windows = n - seq_len - pred_len + 1
-    if n_windows <= 0:
-        return (
-            np.empty((0, seq_len, features.shape[1]), dtype=np.float32),
-            np.empty((0, pred_len, covariates.shape[1]), dtype=np.float32),
-            np.empty((0, pred_len), dtype=np.float32),
-        )
-
-    starts = np.arange(n_windows, dtype=np.int64)
-    t = starts + seq_len
-    past_idx = starts[:, None] + np.arange(seq_len, dtype=np.int64)[None, :]
-    future_idx = t[:, None] + np.arange(pred_len, dtype=np.int64)[None, :]
-
-    x_past = features[past_idx]
-    x_future = covariates[future_idx]
-    y_target = target[future_idx]
-
-    return (
-        np.ascontiguousarray(x_past, dtype=np.float32),
-        np.ascontiguousarray(x_future, dtype=np.float32),
-        np.ascontiguousarray(y_target, dtype=np.float32),
-    )
-
-
 class TiDEDataset(Dataset):
     """
-    Materialize all sliding windows as stacked float32 tensors at init time.
+    Index-based sliding windows over per-series float32 tensors.
 
+    Avoids materializing every window (which OOMs at seq_len=504/672).
     Each sample returns:
       x_past:   [seq_len, num_features]
       x_future: [pred_len, num_covariates]
@@ -71,60 +32,69 @@ class TiDEDataset(Dataset):
     ) -> None:
         feature_cols = feature_cols or FEATURE_COLS
         covariate_cols = covariate_cols or COVARIATE_COLS
-
         if target_col in covariate_cols:
             raise ValueError("target_col must not appear in covariate_cols (label leakage).")
 
         frame = enrich_features(frame)
+        self.seq_len = seq_len
+        self.pred_len = pred_len
+        self.num_covariates = len(covariate_cols)
+        self.target_col = target_col
 
-        x_past_parts: list[np.ndarray] = []
-        x_future_parts: list[np.ndarray] = []
-        y_target_parts: list[np.ndarray] = []
+        self.series_features: list[torch.Tensor] = []
+        self.series_covariates: list[torch.Tensor] = []
+        self.series_targets: list[torch.Tensor] = []
+        # (series_idx, start)
+        self.index: list[tuple[int, int]] = []
 
+        series_idx = 0
         for _, group in frame.groupby("series_id", sort=False):
             sorted_group = group.sort_values("timestamp")
-            features = sorted_group[feature_cols].astype(np.float32).fillna(0.0).to_numpy()
-            covariates = sorted_group[covariate_cols].astype(np.float32).fillna(0.0).to_numpy()
-            target = sorted_group[target_col].astype(np.float32).fillna(0.0).to_numpy()
-
-            x_past, x_future, y_target = _build_series_windows(
-                features, covariates, target, seq_len, pred_len
+            features = torch.from_numpy(
+                sorted_group[feature_cols].astype(np.float32).fillna(0.0).to_numpy()
             )
-            if x_past.shape[0] == 0:
+            covariates = torch.from_numpy(
+                sorted_group[covariate_cols].astype(np.float32).fillna(0.0).to_numpy()
+            )
+            target = torch.from_numpy(
+                sorted_group[target_col].astype(np.float32).fillna(0.0).to_numpy()
+            )
+
+            n = int(target.shape[0])
+            n_windows = n - seq_len - pred_len + 1
+            if n_windows <= 0:
                 continue
 
-            x_past_parts.append(x_past)
-            x_future_parts.append(x_future)
-            y_target_parts.append(y_target)
+            self.series_features.append(features)
+            self.series_covariates.append(covariates)
+            self.series_targets.append(target)
+            for start in range(n_windows):
+                self.index.append((series_idx, start))
+            series_idx += 1
 
-        if not x_past_parts:
+        if not self.index:
             raise ValueError(
                 "No training windows could be created; check seq_len/pred_len and data size."
             )
 
-        self.x_past = torch.from_numpy(np.concatenate(x_past_parts, axis=0))
-        self.x_future = torch.from_numpy(np.concatenate(x_future_parts, axis=0))
-        self.y_target = torch.from_numpy(np.concatenate(y_target_parts, axis=0))
-        self.seq_len = seq_len
-        self.pred_len = pred_len
-        self.num_covariates = len(covariate_cols)
-        self._validate_tensors()
-
-    def _validate_tensors(self) -> None:
-        if self.x_future.shape[-1] != self.num_covariates:
-            raise ValueError("x_future must contain covariates only.")
-        if self.x_past.shape[1] != self.seq_len:
-            raise ValueError("x_past seq_len mismatch.")
-        if self.x_future.shape[1] != self.pred_len:
-            raise ValueError("x_future pred_len mismatch.")
-        if self.y_target.shape[1] != self.pred_len:
-            raise ValueError("y_target pred_len mismatch.")
+        bytes_est = sum(t.numel() for t in self.series_features) * 4
+        print(
+            f"  dataset series={len(self.series_features)} windows={len(self.index)} "
+            f"feature_bytes≈{bytes_est / 1e6:.1f}MB",
+            flush=True,
+        )
 
     def __len__(self) -> int:
-        return self.x_past.shape[0]
+        return len(self.index)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return self.x_past[idx], self.x_future[idx], self.y_target[idx]
+        series_idx, start = self.index[idx]
+        end = start + self.seq_len
+        fut_end = end + self.pred_len
+        x_past = self.series_features[series_idx][start:end]
+        x_future = self.series_covariates[series_idx][end:fut_end]
+        y_target = self.series_targets[series_idx][end:fut_end]
+        return x_past, x_future, y_target
 
 
 def chronological_split(

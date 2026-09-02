@@ -244,7 +244,12 @@ def predict_with_model(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate private test predictions.")
-    parser.add_argument("--input_dir", type=Path, default=None)
+    parser.add_argument(
+        "--input_dir",
+        type=Path,
+        default=Path("../../data"),
+        help="Directory with train.csv and validation_input.csv (default: ../../data).",
+    )
     parser.add_argument("--output_file", required=True, type=Path)
     parser.add_argument(
         "--checkpoint",
