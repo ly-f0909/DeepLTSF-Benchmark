@@ -79,7 +79,7 @@ class ForecastModel(nn.Module):
 
     def __init__(
         self,
-        seq_len: int = 336,
+        seq_len: int = 504,
         pred_len: int = 24,
         num_features: int = NUM_COVARIATES + 1,
         num_covariates: int = NUM_COVARIATES,

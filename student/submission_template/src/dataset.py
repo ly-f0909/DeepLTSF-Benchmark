@@ -1,4 +1,4 @@
-"""Pre-materialized TiDE dataset with in-memory float32 tensors."""
+"""Pre-materialized TiDE dataset with engineered features and in-memory tensors."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from src.features import COVARIATE_COLS, FEATURE_COLS, TARGET_COL
+from src.features import COVARIATE_COLS, FEATURE_COLS, TARGET_COL, enrich_features
 
 
 def _build_series_windows(
@@ -18,12 +18,12 @@ def _build_series_windows(
     pred_len: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-  Build aligned windows for one series.
+    Build aligned windows for one series.
 
-  For anchor time t (= start + seq_len):
-    x_past   = features[t - seq_len : t]          (history, inclusive start, exclusive end)
-    x_future = covariates[t : t + pred_len]       (known future covariates only, NO target)
-    y_target = target[t : t + pred_len]           (future target labels)
+    For anchor time t (= start + seq_len):
+      x_past   = features[t - seq_len : t]
+      x_future = covariates[t : t + pred_len]   (known future covariates only, NO target)
+      y_target = target[t : t + pred_len]
     """
     n = target.shape[0]
     n_windows = n - seq_len - pred_len + 1
@@ -55,9 +55,9 @@ class TiDEDataset(Dataset):
     Materialize all sliding windows as stacked float32 tensors at init time.
 
     Each sample returns:
-      x_past:   [seq_len, num_features]   historical covariates + target
-      x_future: [pred_len, num_covariates] known future covariates (target excluded)
-      y_target: [pred_len]                 future target values
+      x_past:   [seq_len, num_features]
+      x_future: [pred_len, num_covariates]
+      y_target: [pred_len]
     """
 
     def __init__(
@@ -74,6 +74,8 @@ class TiDEDataset(Dataset):
 
         if target_col in covariate_cols:
             raise ValueError("target_col must not appear in covariate_cols (label leakage).")
+
+        frame = enrich_features(frame)
 
         x_past_parts: list[np.ndarray] = []
         x_future_parts: list[np.ndarray] = []
@@ -106,7 +108,6 @@ class TiDEDataset(Dataset):
         self.seq_len = seq_len
         self.pred_len = pred_len
         self.num_covariates = len(covariate_cols)
-
         self._validate_tensors()
 
     def _validate_tensors(self) -> None:

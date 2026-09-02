@@ -1,4 +1,4 @@
-"""Inference entrypoint for TiDE private evaluation."""
+"""Inference entrypoint for TiDE with optional multi-seed ensemble averaging."""
 
 from __future__ import annotations
 
@@ -17,8 +17,10 @@ from src.data_io import (
     load_train_frame,
     resolve_data_dir,
 )
-from src.features import COVARIATE_COLS, FEATURE_COLS, TARGET_COL, TARGET_IDX
+from src.features import COVARIATE_COLS, FEATURE_COLS, TARGET_COL, TARGET_IDX, enrich_features
 from src.model import ForecastModel
+
+DEFAULT_ENSEMBLE_SEEDS = (42, 2024, 777)
 
 
 def resolve_device() -> torch.device:
@@ -30,7 +32,7 @@ def resolve_device() -> torch.device:
 def build_model_from_checkpoint(checkpoint: dict) -> ForecastModel:
     config = checkpoint.get("config", {})
     return ForecastModel(
-        seq_len=config.get("seq_len", 336),
+        seq_len=config.get("seq_len", 504),
         pred_len=config.get("pred_len", 24),
         num_features=config.get("num_features", len(FEATURE_COLS)),
         num_covariates=config.get("num_covariates", len(COVARIATE_COLS)),
@@ -43,13 +45,42 @@ def build_model_from_checkpoint(checkpoint: dict) -> ForecastModel:
     )
 
 
+def load_checkpoint_dict(path: Path, device: torch.device) -> dict:
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+        return checkpoint
+    if isinstance(checkpoint, dict):
+        return {"state_dict": checkpoint, "config": {}}
+    raise ValueError(f"Unsupported checkpoint format: {path}")
+
+
+def resolve_checkpoint_paths(args: argparse.Namespace) -> list[Path]:
+    paths: list[Path] = []
+    if args.checkpoints:
+        paths.extend(Path(part.strip()) for part in args.checkpoints.split(",") if part.strip())
+    elif args.ensemble_seeds:
+        seeds = [part.strip() for part in args.ensemble_seeds.split(",") if part.strip()]
+        stem = args.checkpoint.stem
+        suffix = args.checkpoint.suffix or ".pt"
+        parent = args.checkpoint.parent
+        for seed in seeds:
+            paths.append(parent / f"{stem}_seed{seed}{suffix}")
+    else:
+        paths.append(args.checkpoint)
+
+    missing = [str(path) for path in paths if not path.exists()]
+    if missing:
+        raise FileNotFoundError(f"Missing checkpoint(s): {missing}")
+    return paths
+
+
 def extract_future_covariates(
     future_cov_frame: pd.DataFrame,
     future_index: pd.DataFrame,
     start: int,
     length: int,
 ) -> np.ndarray:
-    """Slice future covariates by timestamp alignment (not positional guess)."""
+    """Slice future covariates by timestamp alignment."""
     block_index = future_index.iloc[start : start + length]
     merged = block_index.merge(
         future_cov_frame,
@@ -134,6 +165,9 @@ def forecast_series(
     """Roll out 24-step blocks; RevIN stats recomputed each step (same as training)."""
     seq_len, pred_len = model.seq_len, model.pred_len
 
+    history = enrich_features(history)
+    future_cov_frame = enrich_features(future_cov_frame)
+
     values = (
         history.reindex(columns=FEATURE_COLS)
         .astype(np.float32)
@@ -159,7 +193,6 @@ def forecast_series(
             torch.from_numpy(x_future).unsqueeze(0).to(device),
         )[0].detach().cpu().numpy()[:take]
 
-        # Operational load index should be non-negative.
         pred_block = np.clip(pred_block, 0.0, None)
         preds.extend(pred_block.tolist())
 
@@ -173,56 +206,19 @@ def forecast_series(
     return np.asarray(preds[:horizon], dtype=np.float64)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate private test predictions.")
-    parser.add_argument(
-        "--input_dir",
-        type=Path,
-        default=None,
-        help="Directory with train.csv and validation_input.csv (auto-detected if omitted).",
-    )
-    parser.add_argument("--output_file", required=True, type=Path)
-    parser.add_argument("--checkpoint", required=True, type=Path)
-    args = parser.parse_args()
-
-    if not args.checkpoint.exists():
-        raise FileNotFoundError(f"Missing checkpoint: {args.checkpoint}")
-
-    device = resolve_device()
-    print(f"--> inference device: {device}")
-
-    data_dir = resolve_data_dir(args.input_dir)
-    print(f"using data_dir: {data_dir}")
-    forecast_index = load_forecast_index(data_dir)
-    train_frame = load_train_frame(data_dir)
-    cov_frame = load_cov_frame(data_dir)
-
-    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
-        state = checkpoint["state_dict"]
-        config = checkpoint.get("config", {})
-    elif isinstance(checkpoint, dict):
-        state = checkpoint
-        config = {}
-    else:
-        raise ValueError("Checkpoint must be a state_dict or a dict containing `state_dict`.")
-
-    print(f"checkpoint config: seq_len={config.get('seq_len')} pred_len={config.get('pred_len')} "
-          f"use_revin={config.get('use_revin', True)}")
-
-    model = build_model_from_checkpoint(checkpoint if isinstance(checkpoint, dict) else {"config": config, "state_dict": state})
-    model.load_state_dict(state)
-    model.eval()
-    model.to(device)
-
+def predict_with_model(
+    model: ForecastModel,
+    forecast_index: pd.DataFrame,
+    train_frame: pd.DataFrame,
+    cov_frame: pd.DataFrame | None,
+    device: torch.device,
+) -> pd.DataFrame:
     pred_parts: list[pd.DataFrame] = []
     for series_id, index_part in forecast_index.groupby("series_id", sort=False):
         t0 = index_part["timestamp"].min()
         hist = get_series_history(train_frame, series_id, t0)
         if hist.empty:
-            raise ValueError(
-                f"No history in train.csv for series {series_id!r} before {t0}."
-            )
+            raise ValueError(f"No history in train.csv for series {series_id!r} before {t0}.")
 
         future_cov = get_series_future_cov(cov_frame, train_frame, series_id, index_part)
         if len(future_cov) != len(index_part):
@@ -237,14 +233,76 @@ def main() -> None:
         pred_parts.append(part)
 
     pred_long = pd.concat(pred_parts, ignore_index=True)
-
-    # Strictly preserve forecast_index row order.
     predictions = forecast_index[["series_id", "timestamp"]].merge(
         pred_long,
         on=["series_id", "timestamp"],
         how="left",
         validate="one_to_one",
     )
+    return predictions
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Generate private test predictions.")
+    parser.add_argument("--input_dir", type=Path, default=None)
+    parser.add_argument("--output_file", required=True, type=Path)
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=Path("checkpoint.pt"),
+        help="Single checkpoint path (also used as stem for --ensemble-seeds).",
+    )
+    parser.add_argument(
+        "--checkpoints",
+        type=str,
+        default=None,
+        help="Comma-separated checkpoint paths for seed averaging.",
+    )
+    parser.add_argument(
+        "--ensemble-seeds",
+        type=str,
+        default=None,
+        help="Comma-separated seeds; loads checkpoint_seed{seed}.pt next to --checkpoint. "
+        f"Example: {','.join(str(s) for s in DEFAULT_ENSEMBLE_SEEDS)}",
+    )
+    args = parser.parse_args()
+
+    device = resolve_device()
+    print(f"--> inference device: {device}")
+
+    checkpoint_paths = resolve_checkpoint_paths(args)
+    print(f"--> using {len(checkpoint_paths)} checkpoint(s):")
+    for path in checkpoint_paths:
+        print(f"    - {path}")
+
+    data_dir = resolve_data_dir(args.input_dir)
+    print(f"using data_dir: {data_dir}")
+    forecast_index = load_forecast_index(data_dir)
+    train_frame = load_train_frame(data_dir)
+    cov_frame = load_cov_frame(data_dir)
+
+    ensemble_preds: list[np.ndarray] = []
+    for path in checkpoint_paths:
+        checkpoint = load_checkpoint_dict(path, device)
+        config = checkpoint.get("config", {})
+        print(
+            f"loading {path.name}: seq_len={config.get('seq_len')} "
+            f"pred_len={config.get('pred_len')} use_revin={config.get('use_revin', True)} "
+            f"num_covariates={config.get('num_covariates')}"
+        )
+        model = build_model_from_checkpoint(checkpoint)
+        model.load_state_dict(checkpoint["state_dict"])
+        model.eval()
+        model.to(device)
+
+        predictions = predict_with_model(model, forecast_index, train_frame, cov_frame, device)
+        ensemble_preds.append(predictions["prediction"].to_numpy(dtype=np.float64))
+
+    averaged = np.mean(np.stack(ensemble_preds, axis=0), axis=0)
+    averaged = np.clip(averaged, 0.0, None)
+
+    predictions = forecast_index[["series_id", "timestamp"]].copy()
+    predictions["prediction"] = averaged
     predictions["timestamp"] = predictions["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S")
 
     print_prediction_diagnostics(predictions, train_frame, forecast_index)

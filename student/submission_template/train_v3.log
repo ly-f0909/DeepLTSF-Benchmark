@@ -16,3 +16,19 @@ epoch 07  lr=8.73e-04  train_smooth_l1=1.330598  val_smooth_l1=1.317940
   saved best -> checkpoint.pt (val_smooth_l1=1.317940)
 epoch 08  lr=8.36e-04  train_smooth_l1=1.296628  val_smooth_l1=1.280992
   saved best -> checkpoint.pt (val_smooth_l1=1.280992)
+epoch 09  lr=7.96e-04  train_smooth_l1=1.250545  val_smooth_l1=1.256890
+  saved best -> checkpoint.pt (val_smooth_l1=1.256890)
+epoch 10  lr=7.53e-04  train_smooth_l1=1.206373  val_smooth_l1=1.220456
+  saved best -> checkpoint.pt (val_smooth_l1=1.220456)
+epoch 11  lr=7.06e-04  train_smooth_l1=1.180800  val_smooth_l1=1.198906
+  saved best -> checkpoint.pt (val_smooth_l1=1.198906)
+epoch 12  lr=6.58e-04  train_smooth_l1=1.146562  val_smooth_l1=1.163878
+  saved best -> checkpoint.pt (val_smooth_l1=1.163878)
+epoch 13  lr=6.08e-04  train_smooth_l1=1.117960  val_smooth_l1=1.199208
+epoch 14  lr=5.57e-04  train_smooth_l1=1.091179  val_smooth_l1=1.166642
+epoch 15  lr=5.05e-04  train_smooth_l1=1.060829  val_smooth_l1=1.168938
+epoch 16  lr=4.53e-04  train_smooth_l1=1.037162  val_smooth_l1=1.173393
+epoch 17  lr=4.02e-04  train_smooth_l1=1.013538  val_smooth_l1=1.176305
+epoch 18  lr=3.52e-04  train_smooth_l1=0.990462  val_smooth_l1=1.145515
+  saved best -> checkpoint.pt (val_smooth_l1=1.145515)
+epoch 19  lr=3.04e-04  train_smooth_l1=0.968141  val_smooth_l1=1.155653
