@@ -1,7 +1,9 @@
 """Standalone LightGBM hourly forecasting pipeline (independent of TiDE).
 
-Trains on train.csv with lag / rolling / future-known covariates, then writes
-predictions_lgb.csv aligned to the official forecast index.
+Feature design avoids mid/long-horizon autoregressive drift:
+  - future-known covariate interactions and calendar features
+  - static per-series target encodings
+  - long lag anchors (lag_336 / lag_504) looked up from real history only
 
 Example:
   python lightgbm_pipeline.py --data-dir ../../data --output_file predictions_lgb.csv
@@ -27,15 +29,15 @@ def _import_lightgbm():
 
 
 TARGET_COL = "target"
-LAGS = (1, 2, 24, 48, 168)
+LAGS = (1, 2, 24, 48, 168, 336, 504)
 ROLL_WINDOWS = (24, 168)
+EPS = 1e-5
 
 KNOWN_FUTURE_COVARIATES = [
     "hour_sin",
     "hour_cos",
     "dow_sin",
     "dow_cos",
-    "is_weekend",
     "trend",
     "workload_intensity",
     "demand_forecast",
@@ -55,9 +57,12 @@ KNOWN_FUTURE_COVARIATES = [
     "zone_cos",
 ]
 
-TIME_FEATURE_COLS = ["hour", "dayofweek"]
+TIME_FEATURE_COLS = ["hour", "dayofweek", "is_weekend", "hour_dow_cat"]
+INTERACT_COLS = ["demand_staffing_gap", "demand_staffing_ratio"]
+STATIC_COLS = ["series_mean", "series_median", "series_std", "series_q75"]
 LAG_COLS = [f"lag_{lag}" for lag in LAGS]
 ROLL_COLS = [f"rolling_{stat}_{window}" for window in ROLL_WINDOWS for stat in ("mean", "std")]
+CATEGORICAL_COLS = ["hour_dow_cat"]
 
 
 def resolve_data_dir(explicit: Path) -> Path:
@@ -89,23 +94,52 @@ def load_future_covariates(data_dir: Path) -> pd.DataFrame | None:
     return None
 
 
-def add_time_features(frame: pd.DataFrame) -> pd.DataFrame:
+def add_deterministic_features(frame: pd.DataFrame) -> pd.DataFrame:
+    """Calendar + future-known demand/staffing interactions. No target used."""
     out = frame.copy()
     timestamps = pd.to_datetime(out["timestamp"])
-    out["hour"] = timestamps.dt.hour.astype(np.int16)
-    out["dayofweek"] = timestamps.dt.dayofweek.astype(np.int16)
+    hour = timestamps.dt.hour.astype(np.int16)
+    dayofweek = timestamps.dt.dayofweek.astype(np.int16)
+    out["hour"] = hour
+    out["dayofweek"] = dayofweek
+    out["is_weekend"] = (dayofweek >= 5).astype(np.int8)
+    out["hour_dow_cat"] = (hour.astype(np.int32) * 7 + dayofweek.astype(np.int32)).astype(
+        np.int32
+    )
+
     if "demand_forecast" in out.columns and "staffing_forecast" in out.columns:
         demand = pd.to_numeric(out["demand_forecast"], errors="coerce")
         staffing = pd.to_numeric(out["staffing_forecast"], errors="coerce")
         out["demand_staffing_gap"] = (demand - staffing).astype(np.float32)
+        out["demand_staffing_ratio"] = (demand / (staffing + EPS)).astype(np.float32)
+    else:
+        out["demand_staffing_gap"] = np.float32(0.0)
+        out["demand_staffing_ratio"] = np.float32(0.0)
     return out
 
 
-def available_covariate_cols(frame: pd.DataFrame) -> list[str]:
-    cols = [col for col in KNOWN_FUTURE_COVARIATES if col in frame.columns]
-    if "demand_staffing_gap" in frame.columns:
-        cols.append("demand_staffing_gap")
-    return cols
+def compute_series_target_encoding(history: pd.DataFrame) -> pd.DataFrame:
+    """Static per-series target stats from historical rows only."""
+    target = pd.to_numeric(history[TARGET_COL], errors="coerce")
+    stats = (
+        history.assign(_target=target)
+        .groupby("series_id", sort=False)["_target"]
+        .agg(
+            series_mean="mean",
+            series_median="median",
+            series_std="std",
+            series_q75=lambda s: s.quantile(0.75),
+        )
+    )
+    return stats
+
+
+def add_static_encoding(frame: pd.DataFrame, series_stats: pd.DataFrame) -> pd.DataFrame:
+    out = frame.copy()
+    mapped = series_stats.reindex(out["series_id"].to_numpy())
+    for col in STATIC_COLS:
+        out[col] = mapped[col].to_numpy(dtype=np.float32)
+    return out
 
 
 def add_lag_rolling_features(frame: pd.DataFrame) -> pd.DataFrame:
@@ -127,8 +161,56 @@ def add_lag_rolling_features(frame: pd.DataFrame) -> pd.DataFrame:
     return pd.concat(parts, ignore_index=True)
 
 
+def attach_history_only_lags(
+    future: pd.DataFrame,
+    history: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Look up lags / rolling stats from real history only.
+
+    Forecast timestamps never append predicted targets, so lag_336 / lag_504
+    stay on observed values throughout a 336-step horizon.
+    """
+    out = future.copy()
+    hist = history.sort_values("timestamp")
+    hist_ts = pd.to_datetime(hist["timestamp"])
+    hist_vals = pd.to_numeric(hist[TARGET_COL], errors="coerce")
+    hist_lookup = pd.Series(hist_vals.to_numpy(dtype=np.float64), index=hist_ts)
+
+    query_ts = pd.to_datetime(out["timestamp"])
+    for lag in LAGS:
+        out[f"lag_{lag}"] = (query_ts - pd.Timedelta(hours=lag)).map(hist_lookup)
+
+    hist_time_np = hist_ts.to_numpy(dtype="datetime64[ns]")
+    hist_val_np = hist_vals.to_numpy(dtype=np.float64)
+    query_np = query_ts.to_numpy(dtype="datetime64[ns]")
+    right = np.searchsorted(hist_time_np, query_np, side="left")
+    for window in ROLL_WINDOWS:
+        left = np.searchsorted(
+            hist_time_np,
+            query_np - np.timedelta64(window, "h"),
+            side="left",
+        )
+        means = np.full(len(out), np.nan, dtype=np.float64)
+        stds = np.full(len(out), np.nan, dtype=np.float64)
+        for i, (lo, hi) in enumerate(zip(left, right)):
+            if hi - lo < window:
+                continue
+            block = hist_val_np[lo:hi]
+            means[i] = float(np.nanmean(block))
+            stds[i] = float(np.nanstd(block, ddof=1)) if block.size > 1 else 0.0
+        out[f"rolling_mean_{window}"] = means
+        out[f"rolling_std_{window}"] = stds
+    return out
+
+
+def available_covariate_cols(frame: pd.DataFrame) -> list[str]:
+    reserved = set(TIME_FEATURE_COLS + INTERACT_COLS + STATIC_COLS + LAG_COLS + ROLL_COLS)
+    return [col for col in KNOWN_FUTURE_COVARIATES if col in frame.columns and col not in reserved]
+
+
 def feature_columns(covariate_cols: list[str]) -> list[str]:
-    return TIME_FEATURE_COLS + LAG_COLS + ROLL_COLS + covariate_cols
+    return TIME_FEATURE_COLS + INTERACT_COLS + STATIC_COLS + LAG_COLS + ROLL_COLS + covariate_cols
 
 
 def chronological_masks(timestamps: pd.Series, train_ratio: float = 0.8) -> tuple[np.ndarray, np.ndarray]:
@@ -149,9 +231,11 @@ def fit_lightgbm(X_train, y_train, X_val, y_val):
         random_state=42,
         n_jobs=-1,
     )
+    cat_cols = [col for col in CATEGORICAL_COLS if col in X_train.columns]
     fit_kwargs = {
         "eval_set": [(X_val, y_val)],
         "eval_metric": "l1",
+        "categorical_feature": cat_cols,
     }
     try:
         model.fit(
@@ -171,60 +255,6 @@ def fit_lightgbm(X_train, y_train, X_val, y_val):
             **fit_kwargs,
         )
     return model
-
-
-def _safe_lag(history: np.ndarray, lag: int) -> float:
-    if history.size < lag:
-        return np.nan
-    return float(history[-lag])
-
-
-def _safe_roll(history: np.ndarray, window: int) -> tuple[float, float]:
-    if history.size < window:
-        return np.nan, np.nan
-    block = history[-window:]
-    return float(block.mean()), float(block.std(ddof=1) if block.size > 1 else 0.0)
-
-
-def features_from_history(
-    history_targets: np.ndarray,
-    cov_row: pd.Series,
-    feature_cols: list[str],
-) -> np.ndarray:
-    values: dict[str, float] = {
-        "hour": float(cov_row["hour"]),
-        "dayofweek": float(cov_row["dayofweek"]),
-    }
-    for lag in LAGS:
-        values[f"lag_{lag}"] = _safe_lag(history_targets, lag)
-    for window in ROLL_WINDOWS:
-        mean, std = _safe_roll(history_targets, window)
-        values[f"rolling_mean_{window}"] = mean
-        values[f"rolling_std_{window}"] = std
-    for col in feature_cols:
-        if col in values:
-            continue
-        raw = cov_row[col] if col in cov_row.index else np.nan
-        values[col] = float(raw) if pd.notna(raw) else np.nan
-    return np.asarray([values[col] for col in feature_cols], dtype=np.float32)
-
-
-def recursive_forecast_series(
-    model,
-    history_targets: np.ndarray,
-    future_cov: pd.DataFrame,
-    feature_cols: list[str],
-) -> np.ndarray:
-    """One-step recursive rollout over the forecast window (no future target leakage)."""
-    preds: list[float] = []
-    history = history_targets.astype(np.float64, copy=True)
-    for _, cov_row in future_cov.iterrows():
-        x = features_from_history(history, cov_row, feature_cols).reshape(1, -1)
-        pred = float(model.predict(x)[0])
-        pred = max(pred, 0.0)
-        preds.append(pred)
-        history = np.append(history, pred)
-    return np.asarray(preds, dtype=np.float64)
 
 
 def align_to_forecast_index(
@@ -260,13 +290,22 @@ def main() -> None:
 
     train = pd.read_csv(data_dir / "train.csv")
     train["timestamp"] = pd.to_datetime(train["timestamp"])
-    train = add_time_features(train)
+    train = add_deterministic_features(train)
+
+    series_stats = compute_series_target_encoding(train)
+    train = add_static_encoding(train, series_stats)
+    print(
+        f"series encodings: n={len(series_stats)} "
+        f"mean-of-mean={series_stats['series_mean'].mean():.4f} "
+        f"mean-of-median={series_stats['series_median'].mean():.4f}",
+        flush=True,
+    )
 
     covariate_cols = available_covariate_cols(train)
     feat_cols = feature_columns(covariate_cols)
-    print(f"feature count={len(feat_cols)}", flush=True)
+    print(f"feature count={len(feat_cols)} categorical={CATEGORICAL_COLS}", flush=True)
 
-    print("building lag / rolling features...", flush=True)
+    print("building lag / rolling / long-anchor features...", flush=True)
     featured = add_lag_rolling_features(train)
     featured = featured.dropna(subset=LAG_COLS + ROLL_COLS + [TARGET_COL]).reset_index(drop=True)
 
@@ -290,7 +329,7 @@ def main() -> None:
 
     val_pred = np.clip(model.predict(X_val), 0.0, None)
     val_mae = float(np.mean(np.abs(val_pred - y_val.to_numpy())))
-    print(f"validation MAE (direct, not recursive)={val_mae:.6f}", flush=True)
+    print(f"validation MAE (direct, history-anchored)={val_mae:.6f}", flush=True)
 
     forecast_index = load_forecast_index(data_dir)
     cov_frame = load_future_covariates(data_dir)
@@ -315,24 +354,23 @@ def main() -> None:
             future_cov = cov_frame.merge(future_index, on=["series_id", "timestamp"], how="inner")
         else:
             future_cov = train.merge(future_index, on=["series_id", "timestamp"], how="inner")
-        future_cov = add_time_features(future_cov).sort_values("timestamp")
         if len(future_cov) != len(future_index):
             raise ValueError(
                 f"Future covariate rows ({len(future_cov)}) != forecast rows "
                 f"({len(future_index)}) for series {series_id!r}."
             )
 
-        yhat = recursive_forecast_series(
-            model,
-            hist[TARGET_COL].to_numpy(dtype=np.float64),
-            future_cov,
-            feat_cols,
-        )
-        part = future_index.copy()
+        future_feat = add_deterministic_features(future_cov)
+        future_feat = add_static_encoding(future_feat, series_stats)
+        future_feat = attach_history_only_lags(future_feat, hist)
+        future_feat = future_feat.sort_values("timestamp")
+
+        yhat = np.clip(model.predict(future_feat[feat_cols]), 0.0, None)
+        part = future_feat[["series_id", "timestamp"]].copy()
         part["prediction"] = yhat
         pred_parts.append(part)
         if i == 1 or i % 16 == 0 or i == n_series:
-            print(f"  forecasted {i}/{n_series} series", flush=True)
+            print(f"  forecasted {i}/{n_series} series (direct, no recursion)", flush=True)
 
     predictions = align_to_forecast_index(pd.concat(pred_parts, ignore_index=True), forecast_index)
     pred = predictions["prediction"].to_numpy(dtype=np.float64)
