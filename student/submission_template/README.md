@@ -38,6 +38,9 @@ The model name is entered in the leaderboard Space when uploading validation pre
 From inside this directory, create the archive with:
 
 ```bash
+# Pack TiDE + LightGBM into the official checkpoint.pt first
+python export_checkpoint.py --tide checkpoint_tide.pt --lgb lgb_model.txt --output_file checkpoint.pt
+
 zip -r final_submission.zip predict.py requirements.txt checkpoint.pt src
 ```
 

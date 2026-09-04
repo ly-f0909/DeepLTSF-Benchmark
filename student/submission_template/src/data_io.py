@@ -74,16 +74,21 @@ def load_cov_frame(input_dir: Path) -> pd.DataFrame | None:
     return None
 
 
-def load_forecast_index(input_dir: Path) -> pd.DataFrame:
+def detect_forecast_index_path(input_dir: Path) -> Path:
     for name in ("forecast_index_test.csv", "forecast_index_validation.csv"):
         path = input_dir / name
         if path.exists():
-            frame = pd.read_csv(path)
-            frame["timestamp"] = pd.to_datetime(frame["timestamp"])
-            return frame
+            return path
     raise FileNotFoundError(
         "Expected forecast_index_test.csv or forecast_index_validation.csv in input_dir."
     )
+
+
+def load_forecast_index(input_dir: Path) -> pd.DataFrame:
+    path = detect_forecast_index_path(input_dir)
+    frame = pd.read_csv(path)
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"])
+    return frame
 
 
 def get_series_history(train_frame: pd.DataFrame, series_id: str, t0: pd.Timestamp) -> pd.DataFrame:
